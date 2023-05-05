@@ -30,3 +30,8 @@ mmr-rpc = { git = "https://github.com/paritytech/substrate", branch = "master" }
 pallet-transaction-payment-rpc = { git = "https://github.com/paritytech/substrate", branch = "master" }
 sp-block-builder = { git = "https://github.com/paritytech/substrate", branch = "master" }
 substrate-state-trie-migration-rpc = { git = "https://github.com/paritytech/substrate", branch = "master" }
+
+serde = { version = "1.0.137", features = ["derive"] }
+sp-state-machine = { git = "https://github.com/paritytech/substrate", branch = "master" }
+sp-trie = { git = "https://github.com/paritytech/substrate", branch = "master" }
+trie-db = "0.27.0"
