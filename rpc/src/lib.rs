@@ -39,7 +39,6 @@ use sp_consensus_babe::BabeApi;
 use sp_keystore::KeystorePtr;
 use txpool_api::TransactionPool;
 
-
 // Added for state_trieInfo RPC
 use std::collections::{HashMap, HashSet, BTreeMap};
 use serde::{Deserialize, Serialize};
@@ -66,10 +65,7 @@ use trie_db::{
 	NibbleVec,
 	NibbleSlice,
 };
-//use hash_db::{HashDBRef, Prefix, EMPTY_PREFIX};
 use std::io::Write;
-
-
 
 /// A type representing all RPC extensions.
 pub type RpcExtension = RpcModule<()>;
@@ -128,8 +124,6 @@ pub struct FullDeps<C, P, SC, B> {
 	pub beefy: BeefyDeps,
 }
 
-
-
 /// TrieInfo result.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,10 +141,6 @@ pub struct TrieInfoResult {
 	pub node_type_count: [(String, u64); 5],
 	/// Trie node child count histogram.
 	pub child_count_histogram: [u64; 17],
-	/// Trie node child span length histogram.
-	pub child_span_length_histogram: [u64; 17],
-	/// Number of nodes whose child count and child span length are different.
-	pub num_count_span_different: u64,
 	/// Trie node reference count histogram.
 	pub reference_count_histogram: Vec<(u32, u64)>,
 }
@@ -180,8 +170,6 @@ impl<C, B, BA> TrieInfo<C, B, BA> {
 
 fn write_histogram_file(filename: String, column0: String, column1: String, data: &Vec<(u32, u64)>) {
 	let mut path = std::env::current_dir().expect("Cannot resolve current dir");
-	//path.push("trie_info");
-	//std::fs::create_dir_all(&path).expect("Failed to create trie_info directory");
 	path.push(filename);
 
 	println!("Writing file: {}", path.display());
@@ -279,11 +267,9 @@ where
 	num_inline_nodes: u64,
 	node_type_count: [(String, u64); 5],
 	child_count_histogram: [u64; 17],
-
-	//mismatch: bool,
 }
 
-fn process_node<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, process_node_data: &mut TrieProcessNodeData<L>/* , iterator: &mut TrieDBNodeIterator<L> */) -> Result<(), JsonRpseeError>
+fn process_node<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, process_node_data: &mut TrieProcessNodeData<L>) -> Result<(), JsonRpseeError>
 where
 	B: BlockT,
 	BA: 'static + sc_client_api::backend::Backend<B>,
@@ -319,7 +305,7 @@ where
 		return Ok(())
 	}
 
-	/* if continue_node */ {
+	{
 		process_node_data.num_nodes += 1;
 
 		match node_hash {
@@ -327,37 +313,6 @@ where
 			_ => {},
 		};
 	}
-
-	/* {
-		let is_hash = node_hash.is_some();
-		let mut iter_is_hash = false;
-		if let Some(iter_node) = iterator.next() {
-			let iter_node = iter_node.map_err(|e| format!("TrieDB node iterator error: {}", e)).map_err(error_into_rpc_err)?;
-
-			if let Some(iter_node_hash) = iter_node.1 {
-				iter_is_hash = true;
-				if let Some(hash) = node_hash {
-					if iter_node_hash != hash {
-						if !process_node_data.mismatch {
-							process_node_data.mismatch = true;
-							println!("Node mismatch. Num processed nodes: {},", process_node_data.num_nodes);
-						}
-					}
-				}
-			}
-		} else {
-			if !process_node_data.mismatch {
-				process_node_data.mismatch = true;
-				println!("Node mismatch (No iterator node for processed node). Num processed nodes: {},", process_node_data.num_nodes);
-			}
-		}
-		if iter_is_hash != is_hash {
-			if !process_node_data.mismatch {
-				process_node_data.mismatch = true;
-				println!("Node hash/inline mismatch. Num processed nodes: {},", process_node_data.num_nodes);
-			}
-		}
-	} */
 
 	match owned_node.node() {
 		Node::Empty => {
@@ -377,7 +332,7 @@ where
 				),
 				index: None,
 			};
-			process_node(backend.clone(), child_to_process, process_node_data/* , iterator */)?;
+			process_node(backend.clone(), child_to_process, process_node_data)?;
 		},
 		Node::Branch(ref nodes, ref value) => {
 			process_node_data.node_type_count[3].1 += 1;
@@ -403,8 +358,6 @@ where
 							}
 						},
 						NodeHandle::Inline(_) => {
-							/* let count = reference_count_tree.get(&1).unwrap_or(&0u64) + 1;
-							reference_count_tree.insert(1, count); */
 						},
 					}
 
@@ -416,7 +369,7 @@ where
 							&node_to_process.partial_key, Some(&slice), Some(i as u8),
 						),
 					};
-					process_node(backend.clone(), child_to_process, process_node_data/* , iterator */)?;
+					process_node(backend.clone(), child_to_process, process_node_data)?;
 				}
 			}
 			process_node_data.child_count_histogram[child_count] += 1;
@@ -440,9 +393,12 @@ where
 		let start_hash = at.unwrap_or_else(|| self.client.info().best_hash);
 		//let start_hash = at.unwrap_or_else(|| self.client.info().finalized_hash);
 
+		/* let mut chain_hashes: Vec<<B as BlockT>::Hash> = Default::default();
+		chain_hashes.push(start_hash); */
+
 		let chain_hashes = get_chain_hashes(self.backend.clone(), start_hash.clone());
-		println!("Num Blocks: {}", chain_hashes.len());
-		for i in 0..chain_hashes.len() {
+		println!("Num blocks to process: {}", chain_hashes.len());
+		/* for i in 0..chain_hashes.len() {
 			if i < 50 || i > chain_hashes.len() - 50 {
 				let block_hash = chain_hashes[i];
 				let block_number = self.client.number(block_hash).map_err(error_into_rpc_err)?;
@@ -456,9 +412,7 @@ where
 				};
 				println!("Block: {}, ({})", block_number, chain_hashes[i].to_string());
 			}
-		}
-		/* let mut chain_hashes: Vec<<B as BlockT>::Hash> = Default::default();
-		chain_hashes.push(start_hash); */
+		} */
 
 		let block_hash = start_hash.to_string();
 		let block_number = self.client.number(start_hash).map_err(error_into_rpc_err)?;
@@ -470,23 +424,6 @@ where
 				"Unknown".to_string()
 			},
 		};
-		let mut num_nodes = 0u64;
-		let mut num_inline_nodes = 0u64;
-		let mut node_type_count = [
-			("Empty".to_string(), 0u64),
-			("Leaf".to_string(), 0u64),
-			("Extension".to_string(), 0u64),
-			("Branch".to_string(), 0u64),
-			("NibbledBranch".to_string(), 0u64),
-			];
-		let mut child_count_histogram = [0u64; 17];
-		let mut child_span_length_histogram = [0u64; 17];
-		let mut num_count_span_different = 0u64;
-
-		let mut hash_done: HashSet<<HashFor<B> as HashT>::Output> = Default::default();
-
-		// Map from node hash to reference count
-		let mut hash_references: HashMap<<HashFor<B> as HashT>::Output, u32> = Default::default();
 
 		// Sorted map of reference count to number of nodes with that reference count.
 		let mut reference_count_tree: BTreeMap<u32, u64> = Default::default();
@@ -509,7 +446,6 @@ where
 				("NibbledBranch".to_string(), 0u64),
 				],
 			child_count_histogram: [0u64; 17],
-			/* mismatch: false, */
 		};
 
 		for hash in chain_hashes {
@@ -527,131 +463,7 @@ where
 					partial_key: NibbleVec::new(),
 					index: None,
 				};
-				//let mut iter = TrieDBNodeIterator::new(&trie).map_err(|e| format!("TrieDB node iterator error: {}", e)).map_err(error_into_rpc_err)?;
-				process_node(self.backend.clone(), node_to_process, &mut process_node_data/* , &mut iter */)?;
-
-				/*let iter_node =
-				TrieDBNodeIterator::new(&trie).map_err(|e| format!("TrieDB node iterator error: {}", e)).map_err(error_into_rpc_err)?;
-				for node in iter_node {
-					let node = node.map_err(|e| format!("TrieDB node iterator error: {}", e)).map_err(error_into_rpc_err)?;
-
-					let mut process_node = true;
-
-					if let Some(node_hash) = node.1 {
-						let node_hash: <B as BlockT>::Hash = node_hash;
-
-						if hash_done.contains(&node_hash) {
-							process_node = false;
-						} else {
-							hash_done.insert(node_hash);
-						}
-					} else {
-						num_inline_nodes += 1;
-					}
-
-					if process_node {
-						num_nodes += 1;
-
-						match node.2.node_plan() {
-							NodePlan::Empty => {
-								node_type_count[0].1 += 1;
-								//child_count_histogram[0] += 1;
-								//child_span_length_histogram[0] += 1;
-							},
-							NodePlan::Leaf { .. } => {
-								node_type_count[1].1 += 1;
-								//child_count_histogram[0] += 1;
-								//child_span_length_histogram[0] += 1;
-							},
-							NodePlan::Extension { .. } => {
-								node_type_count[2].1 += 1;
-							},
-							NodePlan::Branch { .. } => {
-								node_type_count[3].1 += 1;
-							},
-							NodePlan::NibbledBranch { .. } => {
-								node_type_count[4].1 += 1;
-							},
-						}
-						
-						match node.2.node_plan() {
-							NodePlan::Extension { .. } => {
-								child_count_histogram[1] += 1;
-								child_span_length_histogram[1] += 1;
-
-								match node.2.node() {
-									Node::Extension(_, child) => {
-										match child {
-											NodeHandle::Hash(h) => {
-												if let Some(node_hash) = decode_hash::<HashFor<B>>(h) {
-													match hash_references.entry(node_hash) {
-														std::collections::hash_map::Entry::Occupied(mut entry) => {
-															*entry.get_mut() = entry.get() + 1;
-														},
-														std::collections::hash_map::Entry::Vacant(entry) => {
-															entry.insert(1);
-														},
-													}
-												}
-											},
-											NodeHandle::Inline(_) => {
-												//num_inline_nodes += 1;
-												let count = reference_count_tree.get(&1).unwrap_or(&0u64) + 1;
-												reference_count_tree.insert(1, count);
-											},
-										}
-									},
-									_ => {},
-								}
-							},
-							NodePlan::Branch { children, .. } | NodePlan::NibbledBranch { children, .. } => {
-								let mut child_count = 0;
-								let mut child_span_length = 0;
-								for i in 0..16 {
-									if let Some(_) = &children[i] {
-										child_count += 1;
-										child_span_length = i + 1;
-									}
-								}
-								child_count_histogram[child_count] += 1;
-								child_span_length_histogram[child_span_length] += 1;
-								if child_span_length != child_count {
-									num_count_span_different += 1;
-								}
-
-								match node.2.node() {
-									Node::Branch(children, _) | Node::NibbledBranch(_, children, _) => {
-										for i in 0..16 {
-											if let Some(child) = children[i] {
-												match child {
-													NodeHandle::Hash(h) => {
-														if let Some(node_hash) = decode_hash::<HashFor<B>>(h) {
-															match hash_references.entry(node_hash) {
-																std::collections::hash_map::Entry::Occupied(mut entry) => {
-																	*entry.get_mut() = entry.get() + 1;
-																},
-																std::collections::hash_map::Entry::Vacant(entry) => {
-																	entry.insert(1);
-																},
-															}
-														}
-													},
-													NodeHandle::Inline(_) => {
-														//num_inline_nodes += 1;
-														let count = reference_count_tree.get(&1).unwrap_or(&0u64) + 1;
-														reference_count_tree.insert(1, count);
-													},
-												}
-											}
-										}
-									},
-									_ => {},
-								}
-							},
-							_ => {},
-						}
-					}
-				}*/
+				process_node(self.backend.clone(), node_to_process, &mut process_node_data)?;
 			}
 		}
 
@@ -669,21 +481,12 @@ where
 		let data: Vec<(u32, u64)> = (0..process_node_data.child_count_histogram.len()).into_iter().map(|x| (x as u32, process_node_data.child_count_histogram[x])).collect();
 		write_histogram_file("trie_child_count_histogram.txt".to_string(), "Child Count".to_string(), "Count".to_string(), &data);
 
-		let data: Vec<(u32, u64)> = (0..child_span_length_histogram.len()).into_iter().map(|x| (x as u32, child_span_length_histogram[x])).collect();
-		write_histogram_file("trie_child_span_length_histogram.txt".to_string(), "Child Span Length".to_string(), "Count".to_string(), &data);
-
 		let data: Vec<(u32, u64)> = (0..=*reference_count_tree.last_key_value().unwrap_or((&0, &0)).0).into_iter().map(|x| (x as u32, reference_count_tree.get(&x).unwrap_or(&0u64).clone())).collect();
 		write_histogram_file("trie_reference_count_histogram.txt".to_string(), "Reference Count".to_string(), "Count".to_string(), &data);
 
 		let reference_count_histogram = Vec::from_iter(reference_count_tree.into_iter());
 
 		write_histogram_file("trie_reference_count_histogram_sparse.txt".to_string(), "Reference Count".to_string(), "Count".to_string(), &reference_count_histogram);
-
-		println!("Num nodes: {}, Num processed nodes: {}", num_nodes, process_node_data.num_nodes);
-		println!("Num inline nodes: {}, Num processed inline nodes: {}", num_inline_nodes, process_node_data.num_inline_nodes);
-		for i in 0..node_type_count.len() {
-			println!("{}, Num: {}, Num processed: {}", node_type_count[i].0, node_type_count[i].1, process_node_data.node_type_count[i].1);
-		}
 
 		Ok(TrieInfoResult {
 			block_hash: block_hash,
@@ -692,8 +495,6 @@ where
 			num_inline_nodes: process_node_data.num_inline_nodes,
 			node_type_count: process_node_data.node_type_count,
 			child_count_histogram: process_node_data.child_count_histogram,
-			child_span_length_histogram,
-			num_count_span_different,
 			reference_count_histogram,
 		})
 	}
@@ -706,9 +507,6 @@ fn error_into_rpc_err(err: impl std::fmt::Display) -> JsonRpseeError {
 		Some(err.to_string()),
 	)))
 }
-
-
-
 
 /// Instantiate all RPC extensions.
 pub fn create_full<C, P, SC, B>(
