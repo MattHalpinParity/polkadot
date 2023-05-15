@@ -18,7 +18,6 @@
 
 #![warn(missing_docs)]
 
-use core::num;
 use std::sync::Arc;
 
 use jsonrpsee::RpcModule;
@@ -29,7 +28,6 @@ use sc_consensus_beefy::communication::notification::{
 	BeefyBestBlockStream, BeefyVersionedFinalityProofStream,
 };
 use sc_consensus_grandpa::FinalityProofProvider;
-use sc_rpc::chain;
 pub use sc_rpc::{DenyUnsafe, SubscriptionTaskExecutor};
 use sp_api::{ProvideRuntimeApi, HeaderT};
 use sp_block_builder::BlockBuilder;
@@ -49,18 +47,13 @@ use jsonrpsee::{
 };
 use sp_runtime::traits::{
 	Block as BlockT,
-	Hash as HashT,
-	HashFor,
 };
 use sp_state_machine::backend::AsTrieBackend;
 use sp_trie::trie_types::{TrieDBBuilder};
 use trie_db::node::NodeHandle;
 use trie_db::{
-	node::{decode_hash, NodePlan, Node, OwnedNode},
-	TrieDBNodeIterator,
+	node::{decode_hash, Node, OwnedNode, Value},
 	TrieLayout,
-	TrieHash,
-	TrieError,
 	triedb::TrieDB,
 	NibbleVec,
 	NibbleSlice,
@@ -191,15 +184,17 @@ fn write_histogram_file(filename: String, column0: String, column1: String, data
 	}
 }
 
-fn get_chain_hashes<B, BA>(backend: Arc<BA>, hash: <B as BlockT>::Hash) -> Vec<<B as BlockT>::Hash>
+fn add_chain_hashes<B, BA>(backend: Arc<BA>, hash: <B as BlockT>::Hash, chain_hashes: &mut Vec<<B as BlockT>::Hash>, hash_done: &mut HashSet<<B as BlockT>::Hash>)
 where
 	B: BlockT,
 	BA: 'static + sc_client_api::backend::Backend<B>,
 {
-	let mut blocks: Vec<<B as BlockT>::Hash> = Default::default();
-
 	let mut last_hash = hash;
-	blocks.push(last_hash);
+
+	if !hash_done.contains(&last_hash) {
+		hash_done.insert(last_hash);
+		chain_hashes.push(last_hash);
+	}
 
 	let mut last_valid = true;
 	let mut num_allowed = 10000;
@@ -210,13 +205,15 @@ where
 			let parent_hash = header.parent_hash().clone();
 			if backend.state_at(parent_hash).is_ok() {
 				last_hash = parent_hash;
-				blocks.push(last_hash);
-				last_valid = true;
+
+				if !hash_done.contains(&last_hash) {
+					hash_done.insert(last_hash);
+					chain_hashes.push(last_hash);
+					last_valid = true;
+				}
 			}
 		}
 	}
-
-	blocks
 }
 
 fn append_optional_slice_and_nibble(
@@ -253,6 +250,8 @@ where
 	trie: &'db TrieDB<'db, 'cache, L>,
 	node_key: NodeHandle<'a>,
 	partial_key: NibbleVec,
+
+	parent_hash: Option<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out>,
 	index: Option<u8>,
 }
 
@@ -262,14 +261,27 @@ where
 {
 	hash_done: HashSet<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out>,
 	hash_references: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, u32>,
+	hash_depth: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, u32>,
+	hash_child_count: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, u8>,
+
+	//hash_depths: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, HashSet<u32>>,
 
 	num_nodes: u64,
 	num_inline_nodes: u64,
+	num_inline_leaf_nodes: u64,
+	num_inline_branch_nodes: u64,
 	node_type_count: [(String, u64); 5],
 	child_count_histogram: [u64; 17],
+	key_length_histogram: BTreeMap<u32, u64>,
+	num_values: u64,
+	num_leaf_values: u64,
+	num_branch_values: u64,
+	num_inline_values: u64,
+	num_node_values: u64,
+	value_length_histogram: BTreeMap<u32, u64>,
 }
 
-fn process_node<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, process_node_data: &mut TrieProcessNodeData<L>) -> Result<(), JsonRpseeError>
+fn adjust_node_depth<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, depth: u32, process_node_data: &mut TrieProcessNodeData<L>) -> Result<(), JsonRpseeError>
 where
 	B: BlockT,
 	BA: 'static + sc_client_api::backend::Backend<B>,
@@ -289,15 +301,33 @@ where
 		NodeHandle::Inline(data) => (None, data.to_vec()),
 	};
 	let owned_node = OwnedNode::new::<L::Codec>(node_data)
-		.map_err(|e| error_into_rpc_err("DecoderError"))?;
+		.map_err(|_e| error_into_rpc_err("DecoderError"))?;
+
+	// If the node doesn't have a hash (because it is inline) then see if we can create a hash from parent hash and index in parent.
+	let mut node_hash = node_hash;
+	if node_hash.is_none() {
+		if let Some(parent_hash) = node_to_process.parent_hash {
+			if let Some(index) = node_to_process.index {
+				node_hash = Some(<<L as TrieLayout>::Hash as trie_db::Hasher>::hash([parent_hash.as_ref(), &[index]].concat().as_slice()));
+			}
+		}
+	}
 
 	let mut continue_node = true;
 
 	if let Some(hash) = node_hash {			
-		if process_node_data.hash_done.contains(&hash) {
-			continue_node = false;
-		} else {
-			process_node_data.hash_done.insert(hash);
+		match process_node_data.hash_depth.entry(hash) {
+			std::collections::hash_map::Entry::Occupied(mut entry) => {
+				if depth < *entry.get() {
+					*entry.get_mut() = depth;
+				}
+				else {
+					continue_node = false;
+				}
+			},
+			std::collections::hash_map::Entry::Vacant(entry) => {
+				entry.insert(depth);
+			},
 		}
 	}
 
@@ -305,21 +335,176 @@ where
 		return Ok(())
 	}
 
-	{
-		process_node_data.num_nodes += 1;
-
-		match node_hash {
-			None => process_node_data.num_inline_nodes += 1,
-			_ => {},
-		};
+	match owned_node.node() {
+		Node::Empty => {
+		},
+		Node::Leaf(..) => {
+		},
+		Node::Extension(slice, item) => {
+			let child_to_process = TrieProcessNode {
+				trie: node_to_process.trie,
+				node_key: item,
+				partial_key: clone_append_optional_slice_and_nibble(
+					&node_to_process.partial_key, Some(&slice), None
+				),
+				parent_hash: node_hash,
+				index: Some(0),//None,
+			};
+			adjust_node_depth(backend.clone(), child_to_process, depth + 1, process_node_data)?;
+		},
+		Node::Branch(..) => {
+		},
+		Node::NibbledBranch(slice, nodes, _value) => {
+			for i in 0..nodes.len() {
+				if let Some(child_handle) = nodes[i] {
+					let child_to_process = TrieProcessNode {
+						trie: node_to_process.trie,
+						node_key: child_handle,
+						partial_key: clone_append_optional_slice_and_nibble(
+							&node_to_process.partial_key, Some(&slice), Some(i as u8),
+						),
+						parent_hash: node_hash,
+						index: Some(i as u8),
+					};
+					adjust_node_depth(backend.clone(), child_to_process, depth + 1, process_node_data)?;
+				}
+			}
+		},
 	}
 
+	Ok(())
+}
+
+fn process_node<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, depth: u32, process_node_data: &mut TrieProcessNodeData<L>) -> Result<(), JsonRpseeError>
+where
+	B: BlockT,
+	BA: 'static + sc_client_api::backend::Backend<B>,
+	L: TrieLayout,
+{
+	let node_handle = node_to_process.node_key;
+	let partial_key = node_to_process.partial_key.as_prefix();
+	let (node_hash, node_data) = match node_handle {
+		NodeHandle::Hash(data) => {
+			let node_hash = decode_hash::<L::Hash>(data)
+				.ok_or_else(|| error_into_rpc_err("InvalidHash"))?;
+			let node_data = node_to_process.trie.db().get(&node_hash, partial_key).ok_or_else(|| 
+				error_into_rpc_err("InvalidStateRoot or IncompleteDatabase"))?;
+
+			(Some(node_hash), node_data)
+		},
+		NodeHandle::Inline(data) => (None, data.to_vec()),
+	};
+	let owned_node = OwnedNode::new::<L::Codec>(node_data)
+		.map_err(|_e| error_into_rpc_err("DecoderError"))?;
+
+	let is_inline = node_hash.is_none();
+
+	// If the node doesn't have a hash (because it is inline) then see if we can create a hash from parent hash and index in parent.
+	let mut node_hash = node_hash;
+	if node_hash.is_none() {
+		if let Some(parent_hash) = node_to_process.parent_hash {
+			if let Some(index) = node_to_process.index {
+				node_hash = Some(<<L as TrieLayout>::Hash as trie_db::Hasher>::hash([parent_hash.as_ref(), &[index]].concat().as_slice()));
+			}
+		}
+	}
+
+	let mut continue_node = true;
+
+	if let Some(hash) = node_hash {
+		if process_node_data.hash_done.contains(&hash) {
+			continue_node = false;
+		} else {
+			process_node_data.hash_done.insert(hash);
+		}
+
+		match process_node_data.hash_depth.entry(hash) {
+			std::collections::hash_map::Entry::Occupied(entry) => {
+				if depth < *entry.get() {
+					// Adjust node and child depths.
+					let node_to_process_copy = TrieProcessNode {
+						trie: node_to_process.trie,
+						node_key: node_to_process.node_key,
+						partial_key: node_to_process.partial_key.clone(),
+						parent_hash: node_to_process.parent_hash,
+						index: node_to_process.index,
+					};
+					adjust_node_depth(backend.clone(), node_to_process_copy, depth, process_node_data)?;
+				}
+			},
+			std::collections::hash_map::Entry::Vacant(entry) => {
+				entry.insert(depth);
+			},
+		}
+
+		/* match process_node_data.hash_depths.entry(hash) {
+			std::collections::hash_map::Entry::Occupied(mut entry) => {
+				entry.get_mut().insert(depth);
+			},
+			std::collections::hash_map::Entry::Vacant(entry) => {
+				let mut depths: HashSet<u32> = Default::default();
+				depths.insert(depth);
+				entry.insert(depths);
+			},
+		} */
+	}
+
+	if !continue_node {
+		return Ok(())
+	}
+
+	process_node_data.num_nodes += 1;
+
+	if is_inline {
+		process_node_data.num_inline_nodes += 1;
+	}
+
+	let mut child_count = 0;
 	match owned_node.node() {
 		Node::Empty => {
 			process_node_data.node_type_count[0].1 += 1;
 		},
 		Node::Leaf(slice, value) => {
 			process_node_data.node_type_count[1].1 += 1;
+
+			if is_inline {
+				process_node_data.num_inline_leaf_nodes += 1;
+			}
+
+			process_node_data.num_values += 1;
+			process_node_data.num_leaf_values += 1;
+
+			let value_key = clone_append_optional_slice_and_nibble(&node_to_process.partial_key, Some(&slice), None);
+			let key_length = value_key.len() as u32;
+
+			let count = process_node_data.key_length_histogram.get(&key_length).unwrap_or(&0u64) + 1;
+			process_node_data.key_length_histogram.insert(key_length, count);
+
+			match value {
+				Value::Inline(value) => {
+					process_node_data.num_inline_values += 1;
+
+					let value_length = value.len() as u32;
+
+					let count = process_node_data.value_length_histogram.get(&value_length).unwrap_or(&0u64) + 1;
+					process_node_data.value_length_histogram.insert(value_length, count);
+				},
+				Value::Node(hash) => {
+					process_node_data.num_node_values += 1;
+
+					let mut res = <<L as TrieLayout>::Hash as trie_db::Hasher>::Out::default();
+					res.as_mut().copy_from_slice(hash);
+
+					let prefix = value_key.as_prefix();
+					let value = node_to_process.trie.db().get(&res, prefix).ok_or_else(|| 
+						error_into_rpc_err("No leaf value found"))?;
+
+					let value_length = value.len() as u32;
+
+					let count = process_node_data.value_length_histogram.get(&value_length).unwrap_or(&0u64) + 1;
+					process_node_data.value_length_histogram.insert(value_length, count);
+				}
+			}
 		},
 		Node::Extension(slice, item) => {
 			process_node_data.node_type_count[2].1 += 1;
@@ -330,16 +515,22 @@ where
 				partial_key: clone_append_optional_slice_and_nibble(
 					&node_to_process.partial_key, Some(&slice), None
 				),
-				index: None,
+				parent_hash: node_hash,
+				index: Some(0),
 			};
-			process_node(backend.clone(), child_to_process, process_node_data)?;
+			process_node(backend.clone(), child_to_process, depth + 1, process_node_data)?;
+			child_count = 1;
 		},
-		Node::Branch(ref nodes, ref value) => {
+		Node::Branch(ref _nodes, ref _value) => {
 			process_node_data.node_type_count[3].1 += 1;
 		},
 		Node::NibbledBranch(slice, nodes, value) => {
 			process_node_data.node_type_count[4].1 += 1;
-			let mut child_count = 0;
+
+			if is_inline {
+				process_node_data.num_inline_branch_nodes += 1;
+			}
+
 			for i in 0..nodes.len() {
 				if let Some(child_handle) = nodes[i] {
 					child_count += 1;
@@ -363,17 +554,59 @@ where
 
 					let child_to_process = TrieProcessNode {
 						trie: node_to_process.trie,
-						index: Some(i as u8),
 						node_key: child_handle,
 						partial_key: clone_append_optional_slice_and_nibble(
 							&node_to_process.partial_key, Some(&slice), Some(i as u8),
 						),
+						parent_hash: node_hash,
+						index: Some(i as u8),
 					};
-					process_node(backend.clone(), child_to_process, process_node_data)?;
+					process_node(backend.clone(), child_to_process, depth + 1, process_node_data)?;
 				}
 			}
 			process_node_data.child_count_histogram[child_count] += 1;
+
+			if let Some(value) = value {
+				process_node_data.num_values += 1;
+				process_node_data.num_branch_values += 1;
+
+				let value_key = clone_append_optional_slice_and_nibble(&node_to_process.partial_key, Some(&slice), None);
+				let key_length = value_key.len() as u32;
+
+				let count = process_node_data.key_length_histogram.get(&key_length).unwrap_or(&0u64) + 1;
+				process_node_data.key_length_histogram.insert(key_length, count);
+
+				match value {
+				Value::Inline(value) => {
+					process_node_data.num_inline_values += 1;
+
+					let value_length = value.len() as u32;
+
+					let count = process_node_data.value_length_histogram.get(&value_length).unwrap_or(&0u64) + 1;
+					process_node_data.value_length_histogram.insert(value_length, count);
+				},
+				Value::Node(hash) => {
+					process_node_data.num_node_values += 1;
+
+					let mut res = <<L as TrieLayout>::Hash as trie_db::Hasher>::Out::default();
+					res.as_mut().copy_from_slice(hash);
+
+					let prefix = value_key.as_prefix();
+					let value = node_to_process.trie.db().get(&res, prefix).ok_or_else(|| 
+						error_into_rpc_err("No leaf value found"))?;
+
+					let value_length = value.len() as u32;
+
+					let count = process_node_data.value_length_histogram.get(&value_length).unwrap_or(&0u64) + 1;
+					process_node_data.value_length_histogram.insert(value_length, count);
+				}
+			}
+			}
 		},
+	}
+
+	if let Some(hash) = node_hash {
+		process_node_data.hash_child_count.insert(hash, child_count as u8);
 	}
 
 	Ok(())
@@ -388,31 +621,23 @@ where
 	fn trie_info(&self, at: Option<<B as BlockT>::Hash>) -> RpcResult<TrieInfoResult> {
 		self.deny_unsafe.check_if_safe()?;
 
-		//self.backend.blockchain().leaves()
+		let mut chain_hashes: Vec<<B as BlockT>::Hash> = Default::default();
 
 		let start_hash = at.unwrap_or_else(|| self.client.info().best_hash);
 		//let start_hash = at.unwrap_or_else(|| self.client.info().finalized_hash);
 
-		/* let mut chain_hashes: Vec<<B as BlockT>::Hash> = Default::default();
-		chain_hashes.push(start_hash); */
+		chain_hashes.push(start_hash);
 
-		let chain_hashes = get_chain_hashes(self.backend.clone(), start_hash.clone());
-		println!("Num blocks to process: {}", chain_hashes.len());
-		/* for i in 0..chain_hashes.len() {
-			if i < 50 || i > chain_hashes.len() - 50 {
-				let block_hash = chain_hashes[i];
-				let block_number = self.client.number(block_hash).map_err(error_into_rpc_err)?;
-				let block_number = match block_number {
-					Some(number) => {
-						number.to_string()
-					},
-					None => {
-						"Unknown".to_string()
-					},
-				};
-				println!("Block: {}, ({})", block_number, chain_hashes[i].to_string());
+		/* let mut hash_done: HashSet<<B as BlockT>::Hash> = Default::default();
+		//add_chain_hashes(self.backend.clone(), start_hash.clone(), &mut chain_hashes, &mut hash_done);
+		let leaves = self.backend.blockchain().leaves();
+		if let Ok(leaves) = leaves {
+			for leaf in leaves {
+				add_chain_hashes(self.backend.clone(), leaf.clone(), &mut chain_hashes, &mut hash_done);
 			}
 		} */
+
+		println!("Num blocks to process: {}", chain_hashes.len());
 
 		let block_hash = start_hash.to_string();
 		let block_number = self.client.number(start_hash).map_err(error_into_rpc_err)?;
@@ -427,17 +652,17 @@ where
 
 		// Sorted map of reference count to number of nodes with that reference count.
 		let mut reference_count_tree: BTreeMap<u32, u64> = Default::default();
-		/* {
-			// Root node won't have its reference count included in the below code, so add it here.
-			let count = reference_count_tree.get(&0).unwrap_or(&0u64) + 1;
-			reference_count_tree.insert(0, count);
-		} */
 
 		let mut process_node_data = TrieProcessNodeData {
 			hash_done: Default::default(),
 			hash_references: Default::default(),
+			hash_depth: Default::default(),
+			hash_child_count: Default::default(),
+			//hash_depths: Default::default(),
 			num_nodes: 0u64,
 			num_inline_nodes: 0u64,
+			num_inline_leaf_nodes: 0u64,
+			num_inline_branch_nodes: 0u64,
 			node_type_count: [
 				("Empty".to_string(), 0u64),
 				("Leaf".to_string(), 0u64),
@@ -446,6 +671,13 @@ where
 				("NibbledBranch".to_string(), 0u64),
 				],
 			child_count_histogram: [0u64; 17],
+			key_length_histogram: Default::default(),
+			num_values: 0u64,
+			num_leaf_values: 0u64,
+			num_branch_values: 0u64,
+			num_inline_values: 0u64,
+			num_node_values: 0u64,		
+			value_length_histogram: Default::default(),
 		};
 
 		for hash in chain_hashes {
@@ -461,11 +693,86 @@ where
 					trie: &trie,
 					node_key: NodeHandle::Hash(essence.root().as_ref()),
 					partial_key: NibbleVec::new(),
+					parent_hash: None,
 					index: None,
 				};
-				process_node(self.backend.clone(), node_to_process, &mut process_node_data)?;
+				process_node(self.backend.clone(), node_to_process, 0, &mut process_node_data)?;
 			}
 		}
+
+		{
+			let mut depth_count_tree: BTreeMap<u32, u64> = Default::default();
+			// for (_, depths) in process_node_data.hash_depths.iter() {
+			// 	//let num_depths = depths.len() as u32;
+			// 	let depth_min = depths.iter().min().unwrap();
+			// 	let depth_max = depths.iter().max().unwrap();
+			// 	let num_depths = (depth_max - depth_min) + 1;
+
+			// 	let count = depth_count_tree.get(&num_depths).unwrap_or(&0u64) + 1;
+			// 	depth_count_tree.insert(num_depths, count);
+			// }
+			for (_, depth) in process_node_data.hash_depth.iter() {
+				let count = depth_count_tree.get(&depth).unwrap_or(&0u64) + 1;
+				depth_count_tree.insert(*depth, count);
+			}
+			println!("Depth count histogram:");
+			for (num, count) in depth_count_tree.iter() {
+				println!("Num: {}, Count: {}", num, count);
+			}
+		}
+
+		{
+			let mut depth_child_count_histograms: BTreeMap<u32, [u64; 17]> = Default::default();
+			for (hash, depth) in process_node_data.hash_depth.iter() {
+				if let Some(child_count) = process_node_data.hash_child_count.get(hash) {
+					if depth_child_count_histograms.contains_key(depth) {
+						let histogram = depth_child_count_histograms.get_mut(depth).unwrap();
+						histogram[*child_count as usize] += 1;
+					} else {
+						let mut histogram = [0u64; 17];
+						histogram[*child_count as usize] += 1;
+						depth_child_count_histograms.insert(*depth, histogram);
+					}
+				}
+			}
+
+			println!("Depth child count histograms:");
+			for (depth, histogram) in depth_child_count_histograms {
+				let mut text: String = Default::default();
+				for i in 0..histogram.len() {
+					if i > 0 {
+						text += ", ";
+					}
+					text += &histogram[i].to_string();
+				}
+				println!("Depth: {}, Child count: {}", depth, text);
+			}
+		}
+
+		{
+			println!("Key length histogram:");
+			for (length, count) in process_node_data.key_length_histogram.iter() {
+				println!("Length: {}, Count: {}", length, count);
+			}
+		}
+
+		/* {
+			println!("Value length histogram:");
+			for (length, count) in process_node_data.value_length_histogram.iter() {
+				println!("Length: {}, Count: {}", length, count);
+			}
+		} */
+
+		println!("Num nodes: {}", process_node_data.num_nodes);
+		println!("Num inline nodes: {}", process_node_data.num_inline_nodes);
+		println!("Num inline leaf nodes: {}", process_node_data.num_inline_leaf_nodes);
+		println!("Num inline branch nodes: {}", process_node_data.num_inline_branch_nodes);
+
+		println!("Num values: {}", process_node_data.num_values);
+		println!("Num leaf values: {}", process_node_data.num_leaf_values);
+		println!("Num branch values: {}", process_node_data.num_branch_values);
+		println!("Num inline values: {}", process_node_data.num_inline_values);
+		println!("Num node values: {}", process_node_data.num_node_values);
 
 		// Inline nodes only have 1 reference
 		{
