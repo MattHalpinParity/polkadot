@@ -126,16 +126,50 @@ pub struct TrieInfoResult {
 	pub block_hash: String,
 	/// Block number.
 	pub block_number: String,
+	/// Number of blocks processed
+	pub num_blocks_processed: u64,
 	/// Number of trie nodes.
 	pub num_nodes: u64,
 	/// Number of inline nodes.
 	pub num_inline_nodes: u64,
+	/// Number of inline leaf nodes.
+	pub num_inline_leaf_nodes: u64,
+	/// Number of inline branch nodes.
+	pub num_inline_branch_nodes: u64,
+	/// Number of values.
+	pub num_values: u64,
+	/// Number of leaf values.
+	pub num_leaf_values: u64,
+	/// Number of branch values.
+	pub num_branch_values: u64,
+	/// Number of inline values.
+	pub num_inline_values: u64,
+	/// Number of node values.
+	pub num_node_values: u64,
 	/// Number of nodes of each type.
 	pub node_type_count: [(String, u64); 5],
 	/// Trie node child count histogram.
 	pub child_count_histogram: [u64; 17],
 	/// Trie node reference count histogram.
 	pub reference_count_histogram: Vec<(u32, u64)>,
+	/// Trie node depth histogram.
+	pub depth_histogram: Vec<(u32, u64)>,
+	/// Child count histogram for each depth
+	pub depth_child_count_histograms: Vec<(u32, [u64; 17])>,
+	/// Key length histogram
+	pub key_length_histogram: Vec<(u32, u64)>,
+	/// Value length histogram
+	pub value_length_histogram: Vec<(u32, u64)>,
+}
+
+/// TrieInfo blocks enum
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TrieInfoBlocks {
+	Best,
+	Finalized,
+	BestAndChain,
+	FinalizedAndChain,
+	LeavesAndChains,
 }
 
 /// TrieInfo API
@@ -143,7 +177,7 @@ pub struct TrieInfoResult {
 pub trait TrieInfoApi<BlockHash> {
 	/// Test function
 	#[method(name = "state_trieInfo", blocking)]
-	fn trie_info(&self, at: Option<BlockHash>) -> RpcResult<TrieInfoResult>;
+	fn trie_info(&self, blocks: Option<TrieInfoBlocks>, at: Option<BlockHash>) -> RpcResult<TrieInfoResult>;
 }
 
 /// TrieInfo
@@ -161,7 +195,11 @@ impl<C, B, BA> TrieInfo<C, B, BA> {
 	}
 }
 
-fn write_histogram_file(filename: String, column0: String, column1: String, data: &Vec<(u32, u64)>) {
+fn write_histogram_file<A, B>(filename: String, column0: String, column1: String, data: &Vec<(A, B)>) 
+where
+	A: std::fmt::Display,
+	B: std::fmt::Display,
+{
 	let mut path = std::env::current_dir().expect("Cannot resolve current dir");
 	path.push(filename);
 
@@ -180,6 +218,34 @@ fn write_histogram_file(filename: String, column0: String, column1: String, data
 
 	for entry in data {
 		let data_line = format!("{},{}\n", entry.0, entry.1);
+		writer.write_all(data_line.as_bytes()).expect("Unable to write data");
+	}
+}
+
+fn write_histogram_file_3_columns<A, B, C>(filename: String, column0: String, column1: String, column2: String, data: &Vec<(A, B, C)>) 
+where
+	A: std::fmt::Display,
+	B: std::fmt::Display,
+	C: std::fmt::Display,
+{
+	let mut path = std::env::current_dir().expect("Cannot resolve current dir");
+	path.push(filename);
+
+	println!("Writing file: {}", path.display());
+
+	let file = std::fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(true)
+		.open(path.as_path()).expect("Failed to open file");
+
+	let mut writer = std::io::BufWriter::new(file);
+
+	let header_line = format!("{}, {}, {}\n", column0, column1, column2);
+	writer.write_all(header_line.as_bytes()).expect("Unable to write data");
+
+	for entry in data {
+		let data_line = format!("{},{},{}\n", entry.0, entry.1, entry.2);
 		writer.write_all(data_line.as_bytes()).expect("Unable to write data");
 	}
 }
@@ -475,7 +541,8 @@ where
 			process_node_data.num_leaf_values += 1;
 
 			let value_key = clone_append_optional_slice_and_nibble(&node_to_process.partial_key, Some(&slice), None);
-			let key_length = value_key.len() as u32;
+			let key_nibble_length = value_key.len() as u32;
+			let key_length = key_nibble_length / 2;
 
 			let count = process_node_data.key_length_histogram.get(&key_length).unwrap_or(&0u64) + 1;
 			process_node_data.key_length_histogram.insert(key_length, count);
@@ -571,7 +638,8 @@ where
 				process_node_data.num_branch_values += 1;
 
 				let value_key = clone_append_optional_slice_and_nibble(&node_to_process.partial_key, Some(&slice), None);
-				let key_length = value_key.len() as u32;
+				let key_nibble_length = value_key.len() as u32;
+				let key_length = key_nibble_length / 2;
 
 				let count = process_node_data.key_length_histogram.get(&key_length).unwrap_or(&0u64) + 1;
 				process_node_data.key_length_histogram.insert(key_length, count);
@@ -618,8 +686,14 @@ where
 	C: Send + Sync + 'static + sc_client_api::HeaderBackend<B>,
 	BA: 'static + sc_client_api::backend::Backend<B>,
 {
-	fn trie_info(&self, at: Option<<B as BlockT>::Hash>) -> RpcResult<TrieInfoResult> {
+	fn trie_info(&self, blocks: Option<TrieInfoBlocks>, at: Option<<B as BlockT>::Hash>) -> RpcResult<TrieInfoResult> {
 		self.deny_unsafe.check_if_safe()?;
+
+		let blocks = match blocks {
+			Some(source) => source,
+			None => TrieInfoBlocks::Best,
+		};
+		println!("Blocks: {:?}", blocks);
 
 		let mut chain_hashes: Vec<<B as BlockT>::Hash> = Default::default();
 
@@ -637,7 +711,8 @@ where
 			}
 		} */
 
-		println!("Num blocks to process: {}", chain_hashes.len());
+		let num_blocks_processed = chain_hashes.len() as u64;
+		//println!("Num blocks to process: {}", num_blocks_processed);
 
 		let block_hash = start_hash.to_string();
 		let block_number = self.client.number(start_hash).map_err(error_into_rpc_err)?;
@@ -700,61 +775,58 @@ where
 			}
 		}
 
-		{
-			let mut depth_count_tree: BTreeMap<u32, u64> = Default::default();
-			// for (_, depths) in process_node_data.hash_depths.iter() {
-			// 	//let num_depths = depths.len() as u32;
-			// 	let depth_min = depths.iter().min().unwrap();
-			// 	let depth_max = depths.iter().max().unwrap();
-			// 	let num_depths = (depth_max - depth_min) + 1;
-
-			// 	let count = depth_count_tree.get(&num_depths).unwrap_or(&0u64) + 1;
-			// 	depth_count_tree.insert(num_depths, count);
-			// }
-			for (_, depth) in process_node_data.hash_depth.iter() {
-				let count = depth_count_tree.get(&depth).unwrap_or(&0u64) + 1;
-				depth_count_tree.insert(*depth, count);
-			}
-			println!("Depth count histogram:");
-			for (num, count) in depth_count_tree.iter() {
-				println!("Num: {}, Count: {}", num, count);
-			}
+		let mut depth_count_tree: BTreeMap<u32, u64> = Default::default();
+		// for (_, depths) in process_node_data.hash_depths.iter() {
+		// 	//let num_depths = depths.len() as u32;
+		// 	let depth_min = depths.iter().min().unwrap();
+		// 	let depth_max = depths.iter().max().unwrap();
+		// 	let num_depths = (depth_max - depth_min) + 1;
+		// 	let count = depth_count_tree.get(&num_depths).unwrap_or(&0u64) + 1;
+		// 	depth_count_tree.insert(num_depths, count);
+		// }
+		for (_, depth) in process_node_data.hash_depth.iter() {
+			let count = depth_count_tree.get(&depth).unwrap_or(&0u64) + 1;
+			depth_count_tree.insert(*depth, count);
 		}
+		/* println!("Depth count histogram:");
+		for (num, count) in depth_count_tree.iter() {
+			println!("Num: {}, Count: {}", num, count);
+		} */
+		let depth_histogram = Vec::from_iter(depth_count_tree.into_iter());
 
-		{
-			let mut depth_child_count_histograms: BTreeMap<u32, [u64; 17]> = Default::default();
-			for (hash, depth) in process_node_data.hash_depth.iter() {
-				if let Some(child_count) = process_node_data.hash_child_count.get(hash) {
-					if depth_child_count_histograms.contains_key(depth) {
-						let histogram = depth_child_count_histograms.get_mut(depth).unwrap();
-						histogram[*child_count as usize] += 1;
-					} else {
-						let mut histogram = [0u64; 17];
-						histogram[*child_count as usize] += 1;
-						depth_child_count_histograms.insert(*depth, histogram);
-					}
+		let mut depth_child_count_tree: BTreeMap<u32, [u64; 17]> = Default::default();
+		for (hash, depth) in process_node_data.hash_depth.iter() {
+			if let Some(child_count) = process_node_data.hash_child_count.get(hash) {
+				if depth_child_count_tree.contains_key(depth) {
+					let histogram = depth_child_count_tree.get_mut(depth).unwrap();
+					histogram[*child_count as usize] += 1;
+				} else {
+					let mut histogram = [0u64; 17];
+					histogram[*child_count as usize] += 1;
+					depth_child_count_tree.insert(*depth, histogram);
 				}
 			}
-
-			println!("Depth child count histograms:");
-			for (depth, histogram) in depth_child_count_histograms {
-				let mut text: String = Default::default();
-				for i in 0..histogram.len() {
-					if i > 0 {
-						text += ", ";
-					}
-					text += &histogram[i].to_string();
-				}
-				println!("Depth: {}, Child count: {}", depth, text);
-			}
 		}
+		/* println!("Depth child count histograms:");
+		for (depth, histogram) in depth_child_count_tree {
+			let mut text: String = Default::default();
+			for i in 0..histogram.len() {
+				if i > 0 {
+					text += ", ";
+				}
+				text += &histogram[i].to_string();
+			}
+			println!("Depth: {}, Child count: {}", depth, text);
+		} */
+		let depth_child_count_histograms: Vec<(u32, [u64; 17])> = Vec::from_iter(depth_child_count_tree.into_iter());
 
-		{
+		/* {
 			println!("Key length histogram:");
 			for (length, count) in process_node_data.key_length_histogram.iter() {
 				println!("Length: {}, Count: {}", length, count);
 			}
-		}
+		} */
+		let key_length_histogram = Vec::from_iter(process_node_data.key_length_histogram.into_iter());
 
 		/* {
 			println!("Value length histogram:");
@@ -762,8 +834,9 @@ where
 				println!("Length: {}, Count: {}", length, count);
 			}
 		} */
+		let value_length_histogram = Vec::from_iter(process_node_data.value_length_histogram.into_iter());
 
-		println!("Num nodes: {}", process_node_data.num_nodes);
+		/* println!("Num nodes: {}", process_node_data.num_nodes);
 		println!("Num inline nodes: {}", process_node_data.num_inline_nodes);
 		println!("Num inline leaf nodes: {}", process_node_data.num_inline_leaf_nodes);
 		println!("Num inline branch nodes: {}", process_node_data.num_inline_branch_nodes);
@@ -772,7 +845,7 @@ where
 		println!("Num leaf values: {}", process_node_data.num_leaf_values);
 		println!("Num branch values: {}", process_node_data.num_branch_values);
 		println!("Num inline values: {}", process_node_data.num_inline_values);
-		println!("Num node values: {}", process_node_data.num_node_values);
+		println!("Num node values: {}", process_node_data.num_node_values); */
 
 		// Inline nodes only have 1 reference
 		{
@@ -795,14 +868,43 @@ where
 
 		write_histogram_file("trie_reference_count_histogram_sparse.txt".to_string(), "Reference Count".to_string(), "Count".to_string(), &reference_count_histogram);
 
+		write_histogram_file("trie_depth_histogram.txt".to_string(), "Depth".to_string(), "Count".to_string(), &depth_histogram);
+
+		{
+			let mut expanded_histogram: Vec<(u32, u32, u64)> = Default::default();
+
+			for (depth, histogram) in &depth_child_count_histograms {
+				let mut data: Vec<(u32, u32, u64)> = (0..histogram.len()).into_iter().map(|x| (*depth, x as u32, histogram[x])).collect();
+				expanded_histogram.append(&mut data);
+			}
+
+			write_histogram_file_3_columns("trie_depth_child_count_histograms.txt".to_string(), "Depth".to_string(), "Child Count".to_string(), "Count".to_string(), &expanded_histogram);
+		}
+
+		write_histogram_file("trie_key_length_histogram.txt".to_string(), "Key Length".to_string(), "Count".to_string(), &key_length_histogram);
+
+		write_histogram_file("trie_value_length_histogram.txt".to_string(), "Value Length".to_string(), "Count".to_string(), &value_length_histogram);
+
 		Ok(TrieInfoResult {
 			block_hash: block_hash,
 			block_number: block_number,
+			num_blocks_processed: num_blocks_processed,
 			num_nodes: process_node_data.num_nodes,
 			num_inline_nodes: process_node_data.num_inline_nodes,
+			num_inline_leaf_nodes: process_node_data.num_inline_leaf_nodes,
+			num_inline_branch_nodes: process_node_data.num_inline_branch_nodes,
+			num_values: process_node_data.num_values,
+			num_leaf_values: process_node_data.num_leaf_values,
+			num_branch_values: process_node_data.num_branch_values,
+			num_inline_values: process_node_data.num_inline_values,
+			num_node_values: process_node_data.num_node_values,
 			node_type_count: process_node_data.node_type_count,
 			child_count_histogram: process_node_data.child_count_histogram,
 			reference_count_histogram,
+			depth_histogram: depth_histogram,
+			depth_child_count_histograms: depth_child_count_histograms,
+			key_length_histogram: key_length_histogram,
+			value_length_histogram: value_length_histogram,
 		})
 	}
 }
