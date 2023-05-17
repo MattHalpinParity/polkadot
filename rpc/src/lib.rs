@@ -165,10 +165,15 @@ pub struct TrieInfoResult {
 /// TrieInfo blocks enum
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TrieInfoBlocks {
+	/// Best block only
 	Best,
+	/// Head of finalized chain only
 	Finalized,
+	/// Best block and parent chain
 	BestAndChain,
+	/// Finalized chain
 	FinalizedAndChain,
+	/// All leaves and their parent chains
 	LeavesAndChains,
 }
 
@@ -414,7 +419,7 @@ where
 					&node_to_process.partial_key, Some(&slice), None
 				),
 				parent_hash: node_hash,
-				index: Some(0),//None,
+				index: Some(0),
 			};
 			adjust_node_depth(backend.clone(), child_to_process, depth + 1, process_node_data)?;
 		},
@@ -693,26 +698,46 @@ where
 			Some(source) => source,
 			None => TrieInfoBlocks::Best,
 		};
-		println!("Blocks: {:?}", blocks);
 
 		let mut chain_hashes: Vec<<B as BlockT>::Hash> = Default::default();
 
-		let start_hash = at.unwrap_or_else(|| self.client.info().best_hash);
-		//let start_hash = at.unwrap_or_else(|| self.client.info().finalized_hash);
-
-		chain_hashes.push(start_hash);
-
-		/* let mut hash_done: HashSet<<B as BlockT>::Hash> = Default::default();
-		//add_chain_hashes(self.backend.clone(), start_hash.clone(), &mut chain_hashes, &mut hash_done);
-		let leaves = self.backend.blockchain().leaves();
-		if let Ok(leaves) = leaves {
-			for leaf in leaves {
-				add_chain_hashes(self.backend.clone(), leaf.clone(), &mut chain_hashes, &mut hash_done);
-			}
-		} */
+		let start_hash = match blocks {
+			TrieInfoBlocks::Best => {
+				let hash = at.unwrap_or_else(|| self.client.info().best_hash);
+				chain_hashes.push(hash);
+				hash
+			},
+			TrieInfoBlocks::Finalized => {
+				let hash = at.unwrap_or_else(|| self.client.info().finalized_hash);
+				chain_hashes.push(hash);
+				hash
+			},
+			TrieInfoBlocks::BestAndChain => {
+				let hash = at.unwrap_or_else(|| self.client.info().best_hash);
+				let mut hash_done: HashSet<<B as BlockT>::Hash> = Default::default();
+				add_chain_hashes(self.backend.clone(), hash.clone(), &mut chain_hashes, &mut hash_done);
+				hash
+			},
+			TrieInfoBlocks::FinalizedAndChain => {
+				let hash = at.unwrap_or_else(|| self.client.info().finalized_hash);
+				let mut hash_done: HashSet<<B as BlockT>::Hash> = Default::default();
+				add_chain_hashes(self.backend.clone(), hash.clone(), &mut chain_hashes, &mut hash_done);
+				hash
+			},
+			TrieInfoBlocks::LeavesAndChains => {
+				let mut hash_done: HashSet<<B as BlockT>::Hash> = Default::default();
+				let leaves = self.backend.blockchain().leaves();
+				if let Ok(leaves) = leaves {
+					for leaf in leaves {
+						add_chain_hashes(self.backend.clone(), leaf.clone(), &mut chain_hashes, &mut hash_done);
+					}
+				}
+				let hash = at.unwrap_or_else(|| self.client.info().best_hash);
+				hash
+			},
+		};
 
 		let num_blocks_processed = chain_hashes.len() as u64;
-		//println!("Num blocks to process: {}", num_blocks_processed);
 
 		let block_hash = start_hash.to_string();
 		let block_number = self.client.number(start_hash).map_err(error_into_rpc_err)?;
@@ -776,22 +801,10 @@ where
 		}
 
 		let mut depth_count_tree: BTreeMap<u32, u64> = Default::default();
-		// for (_, depths) in process_node_data.hash_depths.iter() {
-		// 	//let num_depths = depths.len() as u32;
-		// 	let depth_min = depths.iter().min().unwrap();
-		// 	let depth_max = depths.iter().max().unwrap();
-		// 	let num_depths = (depth_max - depth_min) + 1;
-		// 	let count = depth_count_tree.get(&num_depths).unwrap_or(&0u64) + 1;
-		// 	depth_count_tree.insert(num_depths, count);
-		// }
 		for (_, depth) in process_node_data.hash_depth.iter() {
 			let count = depth_count_tree.get(&depth).unwrap_or(&0u64) + 1;
 			depth_count_tree.insert(*depth, count);
 		}
-		/* println!("Depth count histogram:");
-		for (num, count) in depth_count_tree.iter() {
-			println!("Num: {}, Count: {}", num, count);
-		} */
 		let depth_histogram = Vec::from_iter(depth_count_tree.into_iter());
 
 		let mut depth_child_count_tree: BTreeMap<u32, [u64; 17]> = Default::default();
@@ -807,45 +820,11 @@ where
 				}
 			}
 		}
-		/* println!("Depth child count histograms:");
-		for (depth, histogram) in depth_child_count_tree {
-			let mut text: String = Default::default();
-			for i in 0..histogram.len() {
-				if i > 0 {
-					text += ", ";
-				}
-				text += &histogram[i].to_string();
-			}
-			println!("Depth: {}, Child count: {}", depth, text);
-		} */
 		let depth_child_count_histograms: Vec<(u32, [u64; 17])> = Vec::from_iter(depth_child_count_tree.into_iter());
 
-		/* {
-			println!("Key length histogram:");
-			for (length, count) in process_node_data.key_length_histogram.iter() {
-				println!("Length: {}, Count: {}", length, count);
-			}
-		} */
 		let key_length_histogram = Vec::from_iter(process_node_data.key_length_histogram.into_iter());
 
-		/* {
-			println!("Value length histogram:");
-			for (length, count) in process_node_data.value_length_histogram.iter() {
-				println!("Length: {}, Count: {}", length, count);
-			}
-		} */
 		let value_length_histogram = Vec::from_iter(process_node_data.value_length_histogram.into_iter());
-
-		/* println!("Num nodes: {}", process_node_data.num_nodes);
-		println!("Num inline nodes: {}", process_node_data.num_inline_nodes);
-		println!("Num inline leaf nodes: {}", process_node_data.num_inline_leaf_nodes);
-		println!("Num inline branch nodes: {}", process_node_data.num_inline_branch_nodes);
-
-		println!("Num values: {}", process_node_data.num_values);
-		println!("Num leaf values: {}", process_node_data.num_leaf_values);
-		println!("Num branch values: {}", process_node_data.num_branch_values);
-		println!("Num inline values: {}", process_node_data.num_inline_values);
-		println!("Num node values: {}", process_node_data.num_node_values); */
 
 		// Inline nodes only have 1 reference
 		{
