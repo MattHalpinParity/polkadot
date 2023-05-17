@@ -255,6 +255,48 @@ where
 	}
 }
 
+fn generate_code_parameter_text<I>(prefix: String, suffix: String, values: I) -> String
+where
+	I: IntoIterator<Item = String>,
+{
+	let mut text: String = prefix;
+
+	let mut line = "".to_string();
+	let mut added_value = false;
+	for s in values {
+		let add_text = s + ",";
+
+		let mut add_len = add_text.len();
+		if added_value {
+			add_len += 1;
+		}
+
+		// 4 is for the tab that will be added at the start of the line.
+		let can_add = line.len() + add_len + 4 < 100;
+		if can_add {
+			if added_value {
+				line += " ";
+			}
+			line += &add_text;
+			added_value = true;
+		} else {
+			text += "\t";
+			text += &line;
+			text += "\n";
+			line = add_text;
+			added_value = true;
+		}
+	}
+	if line.len() > 0 {
+		text += "\t";
+		text += &line;
+		text += "\n";
+	}
+
+	text += &suffix;
+	text
+}
+
 fn add_chain_hashes<B, BA>(backend: Arc<BA>, hash: <B as BlockT>::Hash, chain_hashes: &mut Vec<<B as BlockT>::Hash>, hash_done: &mut HashSet<<B as BlockT>::Hash>)
 where
 	B: BlockT,
@@ -849,20 +891,62 @@ where
 
 		write_histogram_file("trie_depth_histogram.txt".to_string(), "Depth".to_string(), "Count".to_string(), &depth_histogram);
 
-		{
-			let mut expanded_histogram: Vec<(u32, u32, u64)> = Default::default();
-
-			for (depth, histogram) in &depth_child_count_histograms {
-				let mut data: Vec<(u32, u32, u64)> = (0..histogram.len()).into_iter().map(|x| (*depth, x as u32, histogram[x])).collect();
-				expanded_histogram.append(&mut data);
-			}
-
-			write_histogram_file_3_columns("trie_depth_child_count_histograms.txt".to_string(), "Depth".to_string(), "Child Count".to_string(), "Count".to_string(), &expanded_histogram);
+		let mut depth_child_count_histograms_expanded: Vec<(u32, u32, u64)> = Default::default();
+		for (depth, histogram) in &depth_child_count_histograms {
+			let mut data: Vec<(u32, u32, u64)> = (0..histogram.len()).into_iter().map(|x| (*depth, x as u32, histogram[x])).collect();
+			depth_child_count_histograms_expanded.append(&mut data);
 		}
+		write_histogram_file_3_columns("trie_depth_child_count_histograms.txt".to_string(), "Depth".to_string(), "Child Count".to_string(), "Count".to_string(), &depth_child_count_histograms_expanded);
 
 		write_histogram_file("trie_key_length_histogram.txt".to_string(), "Key Length".to_string(), "Count".to_string(), &key_length_histogram);
 
 		write_histogram_file("trie_value_length_histogram.txt".to_string(), "Value Length".to_string(), "Count".to_string(), &value_length_histogram);
+
+		// Write parameter code to file
+		{
+			let mut code_text: String = "".to_string();
+
+			let depth_child_count_histograms_values = depth_child_count_histograms.iter().map(|x| {
+				let mut histogram_text: String = "".to_string();
+				for i in 0..x.1.len() {
+					if i > 0 {
+						histogram_text += &", ";
+					}
+					histogram_text += &format!("{}", x.1[i]);
+				}
+				format!("({}, [{}])", x.0, histogram_text).to_string()
+			});
+			code_text += &generate_code_parameter_text("pub const DEPTH_CHILD_COUNT_HISTOGRAMS: &[(u32, [u64; 17])] = &[\n".to_string(), "];\n".to_string(), depth_child_count_histograms_values);
+
+			code_text += "\n";
+
+			let key_length_text_values = key_length_histogram.iter().map(|x| format!("({}, {})", x.0, x.1).to_string());
+			code_text += &generate_code_parameter_text("pub const KEY_LENGTH_HISTOGRAM: &[(u32, u32)] = &[\n".to_string(), "];\n".to_string(), key_length_text_values);
+
+			code_text += "\n";
+
+			let value_length_text_values = value_length_histogram.iter().map(|x| format!("({}, {})", x.0, x.1).to_string());
+			code_text += &generate_code_parameter_text("pub const VALUE_LENGTH_HISTOGRAM: &[(u32, u32)] = &[\n".to_string(), "];\n".to_string(), value_length_text_values);
+
+			{
+				let filename = "trie_parameter_code.txt".to_string();
+
+				let mut path = std::env::current_dir().expect("Cannot resolve current dir");
+				path.push(filename);
+
+				println!("Writing file: {}", path.display());
+
+				let file = std::fs::OpenOptions::new()
+					.create(true)
+					.write(true)
+					.truncate(true)
+					.open(path.as_path()).expect("Failed to open file");
+
+				let mut writer = std::io::BufWriter::new(file);
+
+				writer.write_all(code_text.as_bytes()).expect("Unable to write data");
+			}
+		}
 
 		Ok(TrieInfoResult {
 			block_hash: block_hash,
