@@ -136,6 +136,8 @@ pub struct TrieInfoResult {
 	pub num_inline_leaf_nodes: u64,
 	/// Number of inline branch nodes.
 	pub num_inline_branch_nodes: u64,
+	/// Number of nodes unique to the head block.
+	pub average_num_new_nodes: f64,
 	/// Number of values.
 	pub num_values: u64,
 	/// Number of leaf values.
@@ -261,7 +263,7 @@ where
 {
 	let mut text: String = prefix;
 
-	let mut line = "".to_string();
+	/* let mut line = "".to_string();
 	let mut added_value = false;
 	for s in values {
 		let add_text = s + ",";
@@ -290,6 +292,12 @@ where
 	if line.len() > 0 {
 		text += "\t";
 		text += &line;
+		text += "\n";
+	} */
+	for s in values {
+		let add_text = s + ",";
+		text += "\t";
+		text += &add_text;
 		text += "\n";
 	}
 
@@ -322,6 +330,40 @@ where
 				if !hash_done.contains(&last_hash) {
 					hash_done.insert(last_hash);
 					chain_hashes.push(last_hash);
+					last_valid = true;
+				}
+			}
+		}
+	}
+}
+
+fn add_chain_hash_age<B, BA>(backend: Arc<BA>, hash: <B as BlockT>::Hash, chain_hash_age: &mut Vec<(<B as BlockT>::Hash, u64)>, hash_done: &mut HashSet<<B as BlockT>::Hash>)
+where
+	B: BlockT,
+	BA: 'static + sc_client_api::backend::Backend<B>,
+{
+	let mut last_hash = hash;
+	let mut last_age = 0;
+
+	if !hash_done.contains(&last_hash) {
+		hash_done.insert(last_hash);
+		chain_hash_age.push((last_hash, last_age));
+	}
+
+	let mut last_valid = true;
+	let mut num_allowed = 10000;
+	while num_allowed > 0 && last_valid {
+		num_allowed -= 1;
+		last_valid = false;
+		if let Ok(Some(header)) = backend.blockchain().header(last_hash) {
+			let parent_hash = header.parent_hash().clone();
+			if backend.state_at(parent_hash).is_ok() {
+				last_hash = parent_hash;
+				last_age += 1;
+
+				if !hash_done.contains(&last_hash) {
+					hash_done.insert(last_hash);
+					chain_hash_age.push((last_hash, last_age));
 					last_valid = true;
 				}
 			}
@@ -376,13 +418,17 @@ where
 	hash_references: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, u32>,
 	hash_depth: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, u32>,
 	hash_child_count: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, u8>,
+	hash_age: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, u64>,
 
 	//hash_depths: HashMap<<<L as TrieLayout>::Hash as trie_db::Hasher>::Out, HashSet<u32>>,
+
+	depth_age_histogram: BTreeMap<u32, BTreeMap<u64, u64>>,
 
 	num_nodes: u64,
 	num_inline_nodes: u64,
 	num_inline_leaf_nodes: u64,
 	num_inline_branch_nodes: u64,
+	average_num_new_nodes: f64,
 	node_type_count: [(String, u64); 5],
 	child_count_histogram: [u64; 17],
 	key_length_histogram: BTreeMap<u32, u64>,
@@ -392,6 +438,217 @@ where
 	num_inline_values: u64,
 	num_node_values: u64,
 	value_length_histogram: BTreeMap<u32, u64>,
+}
+
+impl<L> TrieProcessNodeData<L> 
+where
+	L: TrieLayout,
+{
+	fn add_depth_age(&mut self, depth: u32, age: u64) {
+
+		if self.depth_age_histogram.contains_key(&depth) {
+			let histogram = self.depth_age_histogram.get_mut(&depth).unwrap();
+			let count = histogram.get(&age).unwrap_or(&0u64) + 1;
+			histogram.insert(age, count);
+		} else {
+			let mut histogram: BTreeMap<u64, u64> = Default::default();
+			let count = 1;
+			histogram.insert(age, count);
+			self.depth_age_histogram.insert(depth, histogram);
+		}
+	}
+}
+
+fn adjust_node_age<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, age: u64, process_node_data: &mut TrieProcessNodeData<L>) -> Result<(), JsonRpseeError>
+where
+	B: BlockT,
+	BA: 'static + sc_client_api::backend::Backend<B>,
+	L: TrieLayout,
+{
+	let node_handle = node_to_process.node_key;
+	let partial_key = node_to_process.partial_key.as_prefix();
+	let (node_hash, node_data) = match node_handle {
+		NodeHandle::Hash(data) => {
+			let node_hash = decode_hash::<L::Hash>(data)
+				.ok_or_else(|| error_into_rpc_err("InvalidHash"))?;
+			let node_data = node_to_process.trie.db().get(&node_hash, partial_key).ok_or_else(|| 
+				error_into_rpc_err("InvalidStateRoot or IncompleteDatabase"))?;
+
+			(Some(node_hash), node_data)
+		},
+		NodeHandle::Inline(data) => (None, data.to_vec()),
+	};
+	let owned_node = OwnedNode::new::<L::Codec>(node_data)
+		.map_err(|_e| error_into_rpc_err("DecoderError"))?;
+
+	// If the node doesn't have a hash (because it is inline) then see if we can create a hash from parent hash and index in parent.
+	let mut node_hash = node_hash;
+	if node_hash.is_none() {
+		if let Some(parent_hash) = node_to_process.parent_hash {
+			if let Some(index) = node_to_process.index {
+				node_hash = Some(<<L as TrieLayout>::Hash as trie_db::Hasher>::hash([parent_hash.as_ref(), &[index]].concat().as_slice()));
+			}
+		}
+	}
+
+	let mut continue_node = true;
+
+	if let Some(hash) = node_hash {		
+		/* if process_node_data.hash_done.contains(&hash) */ {
+			match process_node_data.hash_age.entry(hash) {
+				std::collections::hash_map::Entry::Occupied(mut entry) => {
+					if age > *entry.get() {
+						*entry.get_mut() = age;
+					}
+					else {
+						continue_node = false;
+					}
+				},
+				std::collections::hash_map::Entry::Vacant(entry) => {
+					entry.insert(age);
+				},
+			}
+		}
+	}
+
+	if !continue_node {
+		return Ok(())
+	}
+
+	match owned_node.node() {
+		Node::Empty => {
+		},
+		Node::Leaf(..) => {
+		},
+		Node::Extension(slice, item) => {
+			let child_to_process = TrieProcessNode {
+				trie: node_to_process.trie,
+				node_key: item,
+				partial_key: clone_append_optional_slice_and_nibble(
+					&node_to_process.partial_key, Some(&slice), None
+				),
+				parent_hash: node_hash,
+				index: Some(0),
+			};
+			adjust_node_age(backend.clone(), child_to_process, age, process_node_data)?;
+		},
+		Node::Branch(..) => {
+		},
+		Node::NibbledBranch(slice, nodes, _value) => {
+			for i in 0..nodes.len() {
+				if let Some(child_handle) = nodes[i] {
+					let child_to_process = TrieProcessNode {
+						trie: node_to_process.trie,
+						node_key: child_handle,
+						partial_key: clone_append_optional_slice_and_nibble(
+							&node_to_process.partial_key, Some(&slice), Some(i as u8),
+						),
+						parent_hash: node_hash,
+						index: Some(i as u8),
+					};
+					adjust_node_age(backend.clone(), child_to_process, age, process_node_data)?;
+				}
+			}
+		},
+	}
+
+	Ok(())
+}
+
+fn add_depth_age<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, depth: u32, parent_age: u64, process_node_data: &mut TrieProcessNodeData<L>) -> Result<(), JsonRpseeError>
+where
+	B: BlockT,
+	BA: 'static + sc_client_api::backend::Backend<B>,
+	L: TrieLayout,
+{
+	let node_handle = node_to_process.node_key;
+	let partial_key = node_to_process.partial_key.as_prefix();
+	let (node_hash, node_data) = match node_handle {
+		NodeHandle::Hash(data) => {
+			let node_hash = decode_hash::<L::Hash>(data)
+				.ok_or_else(|| error_into_rpc_err("InvalidHash"))?;
+			let node_data = node_to_process.trie.db().get(&node_hash, partial_key).ok_or_else(|| 
+				error_into_rpc_err("InvalidStateRoot or IncompleteDatabase"))?;
+
+			(Some(node_hash), node_data)
+		},
+		NodeHandle::Inline(data) => (None, data.to_vec()),
+	};
+	let owned_node = OwnedNode::new::<L::Codec>(node_data)
+		.map_err(|_e| error_into_rpc_err("DecoderError"))?;
+
+	// If the node doesn't have a hash (because it is inline) then see if we can create a hash from parent hash and index in parent.
+	let mut node_hash = node_hash;
+	if node_hash.is_none() {
+		if let Some(parent_hash) = node_to_process.parent_hash {
+			if let Some(index) = node_to_process.index {
+				node_hash = Some(<<L as TrieLayout>::Hash as trie_db::Hasher>::hash([parent_hash.as_ref(), &[index]].concat().as_slice()));
+			}
+		}
+	}
+
+	let mut continue_node = true;
+
+	if let Some(hash) = node_hash {		
+		if depth > 0 {
+			if let Some(age) = process_node_data.hash_age.get(&hash) {
+				let age = age.clone();
+
+				if age == parent_age {
+					process_node_data.average_num_new_nodes += 1.0f64;
+				}
+
+				process_node_data.add_depth_age(depth - 1, age - parent_age);
+	
+				if age > parent_age {
+					continue_node = false;
+				}
+			}	
+		}
+	}
+
+	if !continue_node {
+		return Ok(())
+	}
+
+	match owned_node.node() {
+		Node::Empty => {
+		},
+		Node::Leaf(..) => {
+		},
+		Node::Extension(slice, item) => {
+			let child_to_process = TrieProcessNode {
+				trie: node_to_process.trie,
+				node_key: item,
+				partial_key: clone_append_optional_slice_and_nibble(
+					&node_to_process.partial_key, Some(&slice), None
+				),
+				parent_hash: node_hash,
+				index: Some(0),
+			};
+			add_depth_age(backend.clone(), child_to_process, depth + 1, parent_age, process_node_data)?;
+		},
+		Node::Branch(..) => {
+		},
+		Node::NibbledBranch(slice, nodes, _value) => {
+			for i in 0..nodes.len() {
+				if let Some(child_handle) = nodes[i] {
+					let child_to_process = TrieProcessNode {
+						trie: node_to_process.trie,
+						node_key: child_handle,
+						partial_key: clone_append_optional_slice_and_nibble(
+							&node_to_process.partial_key, Some(&slice), Some(i as u8),
+						),
+						parent_hash: node_hash,
+						index: Some(i as u8),
+					};
+					add_depth_age(backend.clone(), child_to_process, depth + 1, parent_age, process_node_data)?;
+				}
+			}
+		},
+	}
+
+	Ok(())
 }
 
 fn adjust_node_depth<B, BA, L>(backend: Arc<BA>, node_to_process: TrieProcessNode<L>, depth: u32, process_node_data: &mut TrieProcessNodeData<L>) -> Result<(), JsonRpseeError>
@@ -800,11 +1057,14 @@ where
 			hash_references: Default::default(),
 			hash_depth: Default::default(),
 			hash_child_count: Default::default(),
+			hash_age: Default::default(),
 			//hash_depths: Default::default(),
+			depth_age_histogram: Default::default(),
 			num_nodes: 0u64,
 			num_inline_nodes: 0u64,
 			num_inline_leaf_nodes: 0u64,
 			num_inline_branch_nodes: 0u64,
+			average_num_new_nodes: 0.0f64,
 			node_type_count: [
 				("Empty".to_string(), 0u64),
 				("Leaf".to_string(), 0u64),
@@ -822,8 +1082,8 @@ where
 			value_length_histogram: Default::default(),
 		};
 
-		for hash in chain_hashes {
-			let state = self.backend.state_at(hash);
+		for hash in chain_hashes.iter() {
+			let state = self.backend.state_at(hash.clone());
 
 			if let Ok(state) = state {
 				let trie_backend = state.as_trie_backend();
@@ -840,6 +1100,62 @@ where
 				};
 				process_node(self.backend.clone(), node_to_process, 0, &mut process_node_data)?;
 			}
+		}
+
+		if chain_hashes.len() == 1 {
+			// If we have only processed one block then we can determine node ages by looking at the chain
+			let mut chain_hash_age: Vec<(<B as BlockT>::Hash, u64)> = Default::default();
+			let mut hash_done: HashSet<<B as BlockT>::Hash> = Default::default();
+			add_chain_hash_age(self.backend.clone(), chain_hashes[0], &mut chain_hash_age, &mut hash_done);
+
+			for (hash, age) in chain_hash_age.iter().rev() {
+				let state = self.backend.state_at(hash.clone());
+	
+				if let Ok(state) = state {
+					let trie_backend = state.as_trie_backend();
+					let essence = trie_backend.essence();
+	
+					let trie = TrieDBBuilder::new(essence, essence.root()).build();
+	
+					let node_to_process = TrieProcessNode {
+						trie: &trie,
+						node_key: NodeHandle::Hash(essence.root().as_ref()),
+						partial_key: NibbleVec::new(),
+						parent_hash: None,
+						index: None,
+					};
+					adjust_node_age(self.backend.clone(), node_to_process, *age, &mut process_node_data)?;
+				}
+			}
+
+			let mut num_source_trees = 0;
+			for i in 0..chain_hash_age.len() {
+				if i < 64 {
+					let (hash, age) = chain_hash_age[i];
+
+					let state = self.backend.state_at(hash.clone());
+		
+					if let Ok(state) = state {
+						let trie_backend = state.as_trie_backend();
+						let essence = trie_backend.essence();
+		
+						let trie = TrieDBBuilder::new(essence, essence.root()).build();
+		
+						let node_to_process = TrieProcessNode {
+							trie: &trie,
+							node_key: NodeHandle::Hash(essence.root().as_ref()),
+							partial_key: NibbleVec::new(),
+							parent_hash: None,
+							index: None,
+						};
+						add_depth_age(self.backend.clone(), node_to_process, 0, age, &mut process_node_data)?;
+
+						num_source_trees += 1;
+					}
+				}
+			}
+
+			process_node_data.average_num_new_nodes *= 1.0f64 / num_source_trees as f64;
 		}
 
 		let mut depth_count_tree: BTreeMap<u32, u64> = Default::default();
@@ -863,6 +1179,28 @@ where
 			}
 		}
 		let depth_child_count_histograms: Vec<(u32, [u64; 17])> = Vec::from_iter(depth_child_count_tree.into_iter());
+
+		/* let mut depth_age_tree: BTreeMap<u32, BTreeMap<u64, u64>> = Default::default();
+		for (hash, age) in process_node_data.hash_age.iter() {
+			if let Some(depth) = process_node_data.hash_depth.get(hash) {
+				if depth_age_tree.contains_key(depth) {
+					let histogram = depth_age_tree.get_mut(depth).unwrap();
+					let count = histogram.get(age).unwrap_or(&0u64) + 1;
+					histogram.insert(*age, count);
+				} else {
+					let mut histogram: BTreeMap<u64, u64> = Default::default();
+					let count = histogram.get(age).unwrap_or(&0u64) + 1;
+					histogram.insert(*age, count);
+					depth_age_tree.insert(*depth, histogram);
+				}
+			}
+		}
+		let depth_age_histograms: Vec<(u32, Vec<(u64, u64)>)> = Vec::from_iter(depth_age_tree.into_iter().map(|(depth, age_histogram)| {
+			(depth, Vec::from_iter(age_histogram.into_iter()))
+		})); */
+		let depth_age_histograms: Vec<(u32, Vec<(u64, u64)>)> = Vec::from_iter(process_node_data.depth_age_histogram.into_iter().map(|(depth, age_histogram)| {
+			(depth, Vec::from_iter(age_histogram.into_iter()))
+		}));
 
 		let key_length_histogram = Vec::from_iter(process_node_data.key_length_histogram.into_iter());
 
@@ -906,6 +1244,11 @@ where
 		{
 			let mut code_text: String = "".to_string();
 
+			code_text += &format!("pub const NUM_NODES: u32 = {};\n", process_node_data.num_nodes);
+			code_text += &format!("pub const AVERAGE_NUM_NEW_NODES: f64 = {};\n", process_node_data.average_num_new_nodes);
+
+			code_text += "\n";
+
 			let depth_child_count_histograms_values = depth_child_count_histograms.iter().map(|x| {
 				let mut histogram_text: String = "".to_string();
 				for i in 0..x.1.len() {
@@ -916,14 +1259,28 @@ where
 				}
 				format!("({}, [{}])", x.0, histogram_text).to_string()
 			});
-			code_text += &generate_code_parameter_text("pub const DEPTH_CHILD_COUNT_HISTOGRAMS: &[(u32, [u64; 17])] = &[\n".to_string(), "];\n".to_string(), depth_child_count_histograms_values);
+			code_text += &generate_code_parameter_text("pub const DEPTH_CHILD_COUNT_HISTOGRAMS: &[(u32, [u32; 17])] = &[\n".to_string(), "];\n".to_string(), depth_child_count_histograms_values);
 
 			code_text += "\n";
 
-			let key_length_text_values = key_length_histogram.iter().map(|x| format!("({}, {})", x.0, x.1).to_string());
+			let depth_age_histograms_values = depth_age_histograms.iter().map(|(depth, age_histogram)| {
+				let mut histogram_text: String = "".to_string();
+				for i in 0..age_histogram.len() {
+					if i > 0 {
+						histogram_text += &", ";
+					}
+					histogram_text += &format!("({}, {})", age_histogram[i].0, age_histogram[i].1);
+				}
+				format!("({}, &[{}])", depth, histogram_text).to_string()
+			});
+			code_text += &generate_code_parameter_text("pub const DEPTH_AGE_HISTOGRAMS: &[(u32, &[(u32, u32)])] = &[\n".to_string(), "];\n".to_string(), depth_age_histograms_values);
+
+			code_text += "\n";
+
+			/* let key_length_text_values = key_length_histogram.iter().map(|x| format!("({}, {})", x.0, x.1).to_string());
 			code_text += &generate_code_parameter_text("pub const KEY_LENGTH_HISTOGRAM: &[(u32, u32)] = &[\n".to_string(), "];\n".to_string(), key_length_text_values);
 
-			code_text += "\n";
+			code_text += "\n"; */
 
 			let value_length_text_values = value_length_histogram.iter().map(|x| format!("({}, {})", x.0, x.1).to_string());
 			code_text += &generate_code_parameter_text("pub const VALUE_LENGTH_HISTOGRAM: &[(u32, u32)] = &[\n".to_string(), "];\n".to_string(), value_length_text_values);
@@ -956,6 +1313,7 @@ where
 			num_inline_nodes: process_node_data.num_inline_nodes,
 			num_inline_leaf_nodes: process_node_data.num_inline_leaf_nodes,
 			num_inline_branch_nodes: process_node_data.num_inline_branch_nodes,
+			average_num_new_nodes: process_node_data.average_num_new_nodes,
 			num_values: process_node_data.num_values,
 			num_leaf_values: process_node_data.num_leaf_values,
 			num_branch_values: process_node_data.num_branch_values,
